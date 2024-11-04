@@ -63,7 +63,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		dataBuffer = append(dataBuffer, data...)
 
 		// Optional: Limit the buffer size if needed
-		maxBufferSize := 10 * 1024 * 1024 // 10MB limit (adjust as needed)
+		maxBufferSize := 40 * 1024 * 1024 // 40MB limit (adjust as needed)
 		if len(dataBuffer) > maxBufferSize {
 			fmt.Println("Error: Payload too large")
 			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "Payload too large"))
@@ -86,40 +86,41 @@ func processAndSendFLAC(conn *websocket.Conn, wavData []byte) error {
 		return fmt.Errorf("Error writing to WAV file: %v", err)
 	}
 
-	// Convert WAV to FLAC
-	flacData, err := convertWAVToFLAC(tempFile.Name())
-	if err != nil {
-		return fmt.Errorf("Error converting WAV to FLAC: %v", err)
-	}
-
-	// Send FLAC data back over WebSocket
-	err = conn.WriteMessage(websocket.BinaryMessage, flacData)
-	if err != nil {
-		return fmt.Errorf("Error sending FLAC data: %v", err)
-	}
-
-	return nil
+	// Convert WAV to FLAC and stream data
+	return streamFLAC(conn, tempFile.Name())
 }
 
-func convertWAVToFLAC(wavFilePath string) ([]byte, error) {
+func streamFLAC(conn *websocket.Conn, wavFilePath string) error {
 	cmd := exec.Command("ffmpeg", "-i", wavFilePath, "-f", "flac", "pipe:1")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("Error creating stdout pipe: %v", err)
+		return fmt.Errorf("Error creating stdout pipe: %v", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("Error starting ffmpeg command: %v", err)
+		return fmt.Errorf("Error starting ffmpeg command: %v", err)
 	}
 
-	flacData, err := io.ReadAll(stdout)
-	if err != nil {
-		return nil, fmt.Errorf("Error reading FLAC data: %v", err)
+	// Stream FLAC data back to the WebSocket client
+	buffer := make([]byte, 1024*512) // 512KB buffer
+	for {
+		n, err := stdout.Read(buffer)
+		if n > 0 {
+			if err := conn.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
+				return fmt.Errorf("Error sending FLAC data: %v", err)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("Error reading FLAC data: %v", err)
+		}
 	}
 
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("ffmpeg command error: %v", err)
+		return fmt.Errorf("ffmpeg command error: %v", err)
 	}
 
-	return flacData, nil
+	return nil
 }
