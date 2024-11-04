@@ -1,0 +1,11 @@
+# docker-compose.dev.yaml
+services:
+  wav_to_flac_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    command: ["go", "run", "main.go"]
