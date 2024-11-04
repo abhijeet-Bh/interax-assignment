@@ -1,57 +1,125 @@
 package main
 
 import (
-	"log"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"os/exec"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4 * 1024 * 1024, // 4MB read buffer
+	WriteBufferSize: 4 * 1024 * 1024, // 4MB write buffer
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
-func handleStream(c *gin.Context) {
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+func main() {
+	router := gin.Default()
+
+	// WebSocket endpoint
+	router.GET("/stream", func(c *gin.Context) {
+		handleWebSocket(c.Writer, c.Request)
+	})
+
+	// Start server
+	router.Run(":8080")
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Failed to upgrade connection:", err)
+		fmt.Println("Error upgrading to WebSocket:", err)
 		return
 	}
 	defer conn.Close()
 
-	// Conversion logic: Read WAV data, convert to FLAC, and stream back
+	var dataBuffer []byte
+
 	for {
-		_, wavData, err := conn.ReadMessage()
+		_, data, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("Error reading WAV data:", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				fmt.Printf("Unexpected close error: %v\n", err)
+			}
 			break
 		}
 
-		// Convert wavData to FLAC format here (mocked in this example)
-		flacData := convertWavToFlac(wavData)
-
-		// Send the converted FLAC data back to the client
-		err = conn.WriteMessage(websocket.BinaryMessage, flacData)
-		if err != nil {
-			log.Println("Error sending FLAC data:", err)
+		// Check if received message is an "EOF" signal
+		if string(data) == "EOF" {
+			// Process the accumulated WAV data and convert to FLAC
+			if err := processAndSendFLAC(conn, dataBuffer); err != nil {
+				fmt.Println("Error in processing and sending FLAC:", err)
+			}
 			break
+		}
+
+		// Accumulate data in buffer
+		dataBuffer = append(dataBuffer, data...)
+
+		// Optional: Limit the buffer size if needed
+		maxBufferSize := 10 * 1024 * 1024 // 10MB limit (adjust as needed)
+		if len(dataBuffer) > maxBufferSize {
+			fmt.Println("Error: Payload too large")
+			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "Payload too large"))
+			return
 		}
 	}
 }
 
-func convertWavToFlac(data []byte) []byte {
-	// Mocked function, integrate actual conversion logic here
-	return data // Return the converted FLAC data
+func processAndSendFLAC(conn *websocket.Conn, wavData []byte) error {
+	// Create temporary file for WAV data
+	tempFile, err := os.CreateTemp("", "input-*.wav")
+	if err != nil {
+		return fmt.Errorf("Error creating temporary WAV file: %v", err)
+	}
+	defer tempFile.Close()
+	defer os.Remove(tempFile.Name())
+
+	// Write WAV data to the temp file
+	if _, err := tempFile.Write(wavData); err != nil {
+		return fmt.Errorf("Error writing to WAV file: %v", err)
+	}
+
+	// Convert WAV to FLAC
+	flacData, err := convertWAVToFLAC(tempFile.Name())
+	if err != nil {
+		return fmt.Errorf("Error converting WAV to FLAC: %v", err)
+	}
+
+	// Send FLAC data back over WebSocket
+	err = conn.WriteMessage(websocket.BinaryMessage, flacData)
+	if err != nil {
+		return fmt.Errorf("Error sending FLAC data: %v", err)
+	}
+
+	return nil
 }
 
-func main() {
-	router := gin.Default()
-	router.GET("/stream", func(c *gin.Context) {
-		handleStream(c)
-	})
-	log.Println("Server running on port 8080")
-	router.Run(":8080")
+func convertWAVToFLAC(wavFilePath string) ([]byte, error) {
+	cmd := exec.Command("ffmpeg", "-i", wavFilePath, "-f", "flac", "pipe:1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("Error creating stdout pipe: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("Error starting ffmpeg command: %v", err)
+	}
+
+	flacData, err := io.ReadAll(stdout)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading FLAC data: %v", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("ffmpeg command error: %v", err)
+	}
+
+	return flacData, nil
 }
